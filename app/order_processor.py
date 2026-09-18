@@ -1,17 +1,30 @@
+import time
 from dataclasses import dataclass
 
-from confluent_kafka import Consumer
+from confluent_kafka import (
+    Consumer,
+    Producer,
+)
 
 from avro_codec import (
     decode_record,
+    encode_record,
     load_avro_schema,
 )
 
 from settings import (
+    BASE_RETRY_DELAY_SECONDS,
     BOOTSTRAP_SERVERS,
     INCOMING_TOPIC,
+    MAX_RETRY_ATTEMPTS,
     PROCESSOR_GROUP,
+    RETRY_HEADER,
+    RETRY_TOPIC,
 )
+
+
+class TemporaryOrderFailure(Exception):
+    pass
 
 
 @dataclass
@@ -27,6 +40,46 @@ class RunningAverage:
         self.total += float(value)
 
         return self.total / self.count
+
+
+def read_retry_attempt(headers):
+
+    if not headers:
+        return 0
+
+    for key, value in headers:
+
+        if key == RETRY_HEADER:
+
+            if isinstance(value, bytes):
+                value = value.decode(
+                    "utf-8"
+                )
+
+            return int(value)
+
+    return 0
+
+
+def validate_order(order, attempt):
+
+    order_number = int(
+        order["orderId"]
+    )
+
+    # IDs ending in 5 simulate a
+    # temporary processing failure.
+    #
+    # They succeed on retry attempt 2.
+
+    if (
+        order_number % 10 == 5
+        and attempt < 2
+    ):
+
+        raise TemporaryOrderFailure(
+            "Temporary downstream service unavailable."
+        )
 
 
 def main():
@@ -51,18 +104,26 @@ def main():
         }
     )
 
+    retry_producer = Producer(
+        {
+            "bootstrap.servers":
+                BOOTSTRAP_SERVERS
+        }
+    )
+
     consumer.subscribe(
-        [INCOMING_TOPIC]
+        [
+            INCOMING_TOPIC,
+            RETRY_TOPIC,
+        ]
     )
 
     statistics = RunningAverage()
 
     print(
-        f"Listening on {INCOMING_TOPIC}"
-    )
-
-    print(
-        "Press Ctrl+C to stop."
+        f"Listening on "
+        f"{INCOMING_TOPIC} and "
+        f"{RETRY_TOPIC}"
     )
 
     print()
@@ -90,33 +151,118 @@ def main():
                 schema,
             )
 
-            average = statistics.add(
-                order["price"]
+            attempt = read_retry_attempt(
+                message.headers()
             )
 
-            print(
-                f"PROCESSED | "
-                f"id={order['orderId']} | "
-                f"product={order['product']} | "
-                f"price={order['price']:.2f}"
-            )
+            try:
 
-            print(
-                f"RUNNING AVERAGE = "
-                f"{average:.2f}"
-            )
+                validate_order(
+                    order,
+                    attempt,
+                )
 
-            print(
-                f"PROCESSED COUNT = "
-                f"{statistics.count}"
-            )
+                average = statistics.add(
+                    order["price"]
+                )
 
-            print("-" * 60)
+                print(
+                    f"SUCCESS | "
+                    f"id={order['orderId']} | "
+                    f"price={order['price']:.2f} | "
+                    f"attempt={attempt}"
+                )
 
-            consumer.commit(
-                message=message,
-                asynchronous=False,
-            )
+                print(
+                    f"RUNNING AVERAGE = "
+                    f"{average:.2f}"
+                )
+
+                print(
+                    f"SUCCESSFUL ORDERS = "
+                    f"{statistics.count}"
+                )
+
+                print("-" * 60)
+
+                consumer.commit(
+                    message=message,
+                    asynchronous=False,
+                )
+
+            except TemporaryOrderFailure as error:
+
+                next_attempt = (
+                    attempt + 1
+                )
+
+                print(
+                    f"TEMPORARY FAILURE | "
+                    f"id={order['orderId']} | "
+                    f"attempt="
+                    f"{next_attempt}/"
+                    f"{MAX_RETRY_ATTEMPTS}"
+                )
+
+                print(
+                    f"Reason: {error}"
+                )
+
+                if (
+                    next_attempt
+                    <= MAX_RETRY_ATTEMPTS
+                ):
+
+                    delay = (
+                        BASE_RETRY_DELAY_SECONDS
+                        ** next_attempt
+                    )
+
+                    print(
+                        f"Retrying after "
+                        f"{delay} seconds..."
+                    )
+
+                    time.sleep(delay)
+
+                    retry_producer.produce(
+                        topic=RETRY_TOPIC,
+                        key=order["orderId"],
+                        value=encode_record(
+                            order,
+                            schema,
+                        ),
+                        headers=[
+                            (
+                                RETRY_HEADER,
+                                str(
+                                    next_attempt
+                                ).encode(
+                                    "utf-8"
+                                ),
+                            )
+                        ],
+                    )
+
+                    retry_producer.flush()
+
+                    print(
+                        f"RETRY PUBLISHED -> "
+                        f"{RETRY_TOPIC}"
+                    )
+
+                else:
+
+                    print(
+                        "Maximum retries reached."
+                    )
+
+                print("-" * 60)
+
+                consumer.commit(
+                    message=message,
+                    asynchronous=False,
+                )
 
     except KeyboardInterrupt:
 
@@ -127,6 +273,8 @@ def main():
     finally:
 
         consumer.close()
+
+        retry_producer.flush()
 
 
 if __name__ == "__main__":
