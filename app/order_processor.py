@@ -1,5 +1,9 @@
 import time
 from dataclasses import dataclass
+from datetime import (
+    datetime,
+    timezone,
+)
 
 from confluent_kafka import (
     Consumer,
@@ -15,6 +19,7 @@ from avro_codec import (
 from settings import (
     BASE_RETRY_DELAY_SECONDS,
     BOOTSTRAP_SERVERS,
+    DEAD_TOPIC,
     INCOMING_TOPIC,
     MAX_RETRY_ATTEMPTS,
     PROCESSOR_GROUP,
@@ -24,6 +29,10 @@ from settings import (
 
 
 class TemporaryOrderFailure(Exception):
+    pass
+
+
+class PermanentOrderFailure(Exception):
     pass
 
 
@@ -67,10 +76,17 @@ def validate_order(order, attempt):
         order["orderId"]
     )
 
-    # IDs ending in 5 simulate a
-    # temporary processing failure.
-    #
-    # They succeed on retry attempt 2.
+    # IDs ending in 0 represent
+    # permanently invalid orders.
+
+    if order_number % 10 == 0:
+
+        raise PermanentOrderFailure(
+            "Order failed permanent business validation."
+        )
+
+    # IDs ending in 5 simulate
+    # temporary downstream failures.
 
     if (
         order_number % 10 == 5
@@ -82,10 +98,68 @@ def validate_order(order, attempt):
         )
 
 
+def send_to_dead_letter(
+    producer,
+    order,
+    error,
+    attempt,
+    failed_schema,
+):
+
+    record = {
+
+        "orderId":
+            order["orderId"],
+
+        "product":
+            order["product"],
+
+        "price":
+            float(
+                order["price"]
+            ),
+
+        "reason":
+            str(error),
+
+        "errorClass":
+            type(error).__name__,
+
+        "attempt":
+            attempt,
+
+        "failedAt":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+    }
+
+    producer.produce(
+        topic=DEAD_TOPIC,
+        key=order["orderId"],
+        value=encode_record(
+            record,
+            failed_schema,
+        ),
+    )
+
+    producer.flush()
+
+    print(
+        f"DEAD LETTER PUBLISHED -> "
+        f"{DEAD_TOPIC} | "
+        f"id={order['orderId']}"
+    )
+
+
 def main():
 
-    schema = load_avro_schema(
+    order_schema = load_avro_schema(
         "order.avsc"
+    )
+
+    failed_schema = load_avro_schema(
+        "failed_order.avsc"
     )
 
     consumer = Consumer(
@@ -105,6 +179,13 @@ def main():
     )
 
     retry_producer = Producer(
+        {
+            "bootstrap.servers":
+                BOOTSTRAP_SERVERS
+        }
+    )
+
+    dead_letter_producer = Producer(
         {
             "bootstrap.servers":
                 BOOTSTRAP_SERVERS
@@ -148,7 +229,7 @@ def main():
 
             order = decode_record(
                 message.value(),
-                schema,
+                order_schema,
             )
 
             attempt = read_retry_attempt(
@@ -169,6 +250,7 @@ def main():
                 print(
                     f"SUCCESS | "
                     f"id={order['orderId']} | "
+                    f"product={order['product']} | "
                     f"price={order['price']:.2f} | "
                     f"attempt={attempt}"
                 )
@@ -204,10 +286,6 @@ def main():
                     f"{MAX_RETRY_ATTEMPTS}"
                 )
 
-                print(
-                    f"Reason: {error}"
-                )
-
                 if (
                     next_attempt
                     <= MAX_RETRY_ATTEMPTS
@@ -219,8 +297,7 @@ def main():
                     )
 
                     print(
-                        f"Retrying after "
-                        f"{delay} seconds..."
+                        f"Waiting {delay} seconds..."
                     )
 
                     time.sleep(delay)
@@ -230,7 +307,7 @@ def main():
                         key=order["orderId"],
                         value=encode_record(
                             order,
-                            schema,
+                            order_schema,
                         ),
                         headers=[
                             (
@@ -253,9 +330,39 @@ def main():
 
                 else:
 
-                    print(
-                        "Maximum retries reached."
+                    send_to_dead_letter(
+                        dead_letter_producer,
+                        order,
+                        error,
+                        attempt,
+                        failed_schema,
                     )
+
+                print("-" * 60)
+
+                consumer.commit(
+                    message=message,
+                    asynchronous=False,
+                )
+
+            except PermanentOrderFailure as error:
+
+                print(
+                    f"PERMANENT FAILURE | "
+                    f"id={order['orderId']}"
+                )
+
+                print(
+                    f"Reason: {error}"
+                )
+
+                send_to_dead_letter(
+                    dead_letter_producer,
+                    order,
+                    error,
+                    attempt,
+                    failed_schema,
+                )
 
                 print("-" * 60)
 
@@ -275,6 +382,8 @@ def main():
         consumer.close()
 
         retry_producer.flush()
+
+        dead_letter_producer.flush()
 
 
 if __name__ == "__main__":

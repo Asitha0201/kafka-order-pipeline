@@ -1,0 +1,35 @@
+{
+  "type": "record",
+  "name": "FailedOrder",
+  "namespace": "streaming.orders.v2",
+  "fields": [
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "product",
+      "type": "string"
+    },
+    {
+      "name": "price",
+      "type": "float"
+    },
+    {
+      "name": "reason",
+      "type": "string"
+    },
+    {
+      "name": "errorClass",
+      "type": "string"
+    },
+    {
+      "name": "attempt",
+      "type": "int"
+    },
+    {
+      "name": "failedAt",
+      "type": "string"
+    }
+  ]
+}
